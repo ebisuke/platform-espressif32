@@ -66,7 +66,7 @@
             "type": "framework",
             "optional": true,
             "owner": "platformio",
-            "version": "https://www.github.com/ebisuke/arduino-esp32.git#top_top_avoidwifibug"
+            "version": "https://www.github.com/ebisuke/arduino-esp32.git#master"
         },
         "framework-arduino-mbcwb": {
             "type": "framework",
@@ -78,7 +78,7 @@
             "type": "framework",
             "optional": true,
             "owner": "platformio",
-            "version": "https://www.github.com/ebisuke/esp-idf.git#4.4.1_avoidwifibug"
+            "version": "https://www.github.com/ebisuke/esp-idf.git#release/4.4.3"
         },
         "tool-esptoolpy": {
             "type": "uploader",
