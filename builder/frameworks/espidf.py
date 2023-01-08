@@ -215,7 +215,7 @@ def get_cmake_code_model(src_dir, build_dir, extra_args=None):
 
 
 def populate_idf_env_vars(idf_env):
-    idf_env["IDF_PATH"] = FRAMEWORK_DIR
+    idf_env["IDF_PATH"] = fs.to_unix_path(FRAMEWORK_DIR)
     additional_packages = [
         os.path.join(TOOLCHAIN_DIR, "bin"),
         platform.get_package_dir("tool-ninja"),
@@ -223,9 +223,9 @@ def populate_idf_env_vars(idf_env):
         os.path.dirname(env.subst("$PYTHONEXE")),
     ]
 
-    if mcu not in ("esp32c3", "esp32s3"):
+    if mcu != "esp32c3":
         additional_packages.append(
-            os.path.join(platform.get_package_dir("toolchain-%sulp" % mcu), "bin"),
+            os.path.join(platform.get_package_dir("toolchain-esp32ulp"), "bin"),
         )
 
     if "windows" in get_systype():
@@ -576,6 +576,15 @@ def generate_project_ld_script(sdk_config, ignore_targets=None):
     )
 
 
+# A temporary workaround to avoid modifying CMake mainly for the "heap" library.
+# The "tlsf.c" source file in this library has an include flag relative
+# to CMAKE_CURRENT_SOURCE_DIR which breaks PlatformIO builds that have a
+# different working directory
+def _fix_component_relative_include(config, build_flags, source_index):
+    source_file_path = config["sources"][source_index]["path"]
+    build_flags = build_flags.replace("..", os.path.dirname(source_file_path) + "/..")
+    return build_flags
+
 def prepare_build_envs(config, default_env, debug_allowed=True):
     build_envs = []
     target_compile_groups = config.get("compileGroups")
@@ -597,6 +606,10 @@ def prepare_build_envs(config, default_env, debug_allowed=True):
         for cc in compile_commands:
             build_flags = cc.get("fragment")
             if not build_flags.startswith("-D"):
+                if build_flags.startswith("-include") and ".." in build_flags:
+                    source_index = cg.get("sourceIndexes")[0]
+                    build_flags = _fix_component_relative_include(
+                        config, build_flags, source_index)
                 build_env.AppendUnique(**build_env.ParseFlags(build_flags))
         build_env.AppendUnique(CPPDEFINES=defines, CPPPATH=includes)
         if sys_includes:
@@ -639,9 +652,17 @@ def compile_source_files(
                 else:
                     obj_path = os.path.join(obj_path, os.path.basename(src_path))
 
+            preserve_source_file_extension = board.get(
+                "build.esp-idf.preserve_source_file_extension", False
+            )
+
             objects.append(
                 build_envs[compile_group_idx].StaticObject(
-                    target=os.path.splitext(obj_path)[0] + ".o",
+                    target=(
+                        obj_path
+                        if preserve_source_file_extension
+                        else os.path.splitext(obj_path)[0]
+                    ) + ".o",
                     source=os.path.realpath(src_path),
                 )
             )
@@ -815,6 +836,8 @@ def get_targets_by_type(target_configs, target_types, ignore_targets=None):
 def get_components_map(target_configs, target_types, ignore_components=None):
     result = {}
     for config in get_targets_by_type(target_configs, target_types, ignore_components):
+        if "nameOnDisk" not in config:
+            config["nameOnDisk"] = "lib%s.a" % config["name"]
         result[config["id"]] = {"config": config}
 
     return result
@@ -1027,7 +1050,14 @@ def install_python_deps():
         result = {}
         packages = {}
         pip_output = subprocess.check_output(
-            [env.subst("$PYTHONEXE"), "-m", "pip", "list", "--format=json"]
+            [
+                env.subst("$PYTHONEXE"),
+                "-m",
+                "pip",
+                "list",
+                "--format=json",
+                "--disable-pip-version-check",
+            ]
         )
         try:
             packages = json.loads(pip_output)
@@ -1043,8 +1073,13 @@ def install_python_deps():
         # https://github.com/platformio/platform-espressif32/issues/635
         "cryptography": ">=2.1.4,<35.0.0",
         "future": ">=0.15.2",
-        "pyparsing": ">=2.0.3,<2.4.0",
+        "pyparsing": ">=3"
+        if platform.get_package_version("framework-espidf")
+        .split(".")[1]
+        .startswith("5")
+        else ">=2.0.3,<2.4.0",
         "kconfiglib": "==13.7.1",
+        "idf-component-manager": "~=1.0",
     }
 
     installed_packages = _get_installed_pip_packages()
@@ -1246,7 +1281,6 @@ project_defines = get_app_defines(project_config)
 project_flags = get_app_flags(project_config, default_config)
 link_args = extract_link_args(elf_config)
 app_includes = get_app_includes(elf_config)
-project_lib_includes = get_project_lib_includes(env)
 
 #
 # Compile bootloader
@@ -1300,32 +1334,6 @@ def _skip_prj_source_files(node):
 
 
 env.AddBuildMiddleware(_skip_prj_source_files)
-
-# Project files should be compiled only when a special
-# option is enabled when running 'test' command
-if "__test" not in COMMAND_LINE_TARGETS or env.GetProjectOption(
-    "test_build_project_src"
-):
-    project_env = env.Clone()
-    if project_target_name != "__idf_main":
-        # Manually add dependencies to CPPPATH since ESP-IDF build system doesn't generate
-        # this info if the folder with sources is not named 'main'
-        # https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#rename-main
-        project_env.AppendUnique(CPPPATH=app_includes["plain_includes"])
-
-    # Add include dirs from PlatformIO build system to project CPPPATH so
-    # they're visible to PIOBUILDFILES
-    project_env.Append(
-        CPPPATH=["$PROJECT_INCLUDE_DIR", "$PROJECT_SRC_DIR"] + project_lib_includes
-    )
-
-    env.Append(
-        PIOBUILDFILES=compile_source_files(
-            target_configs.get(project_target_name),
-            project_env,
-            project_env.subst("$PROJECT_DIR"),
-        )
-    )
 
 #
 # Generate partition table
@@ -1386,6 +1394,52 @@ env.Prepend(
         ),
     ],
 )
+
+#
+# Propagate Arduino defines to the main build environment
+#
+
+if "arduino" in env.subst("$PIOFRAMEWORK"):
+    arduino_config_name = list(
+        filter(
+            lambda config_name: config_name.startswith(
+                "__idf_framework-arduinoespressif32"
+            ),
+            target_configs,
+        )
+    )[0]
+    env.AppendUnique(
+        CPPDEFINES=extract_defines(
+            target_configs.get(arduino_config_name, {}).get("compileGroups", [])[0]
+        )
+    )
+
+# Project files should be compiled only when a special
+# option is enabled when running 'test' command
+if "__test" not in COMMAND_LINE_TARGETS or env.GetProjectOption(
+    "test_build_project_src"
+):
+    project_env = env.Clone()
+    if project_target_name != "__idf_main":
+        # Manually add dependencies to CPPPATH since ESP-IDF build system doesn't generate
+        # this info if the folder with sources is not named 'main'
+        # https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#rename-main
+        project_env.AppendUnique(CPPPATH=app_includes["plain_includes"])
+
+    # Add include dirs from PlatformIO build system to project CPPPATH so
+    # they're visible to PIOBUILDFILES
+    project_env.AppendUnique(
+        CPPPATH=["$PROJECT_INCLUDE_DIR", "$PROJECT_SRC_DIR"]
+        + get_project_lib_includes(env)
+    )
+
+    env.Append(
+        PIOBUILDFILES=compile_source_files(
+            target_configs.get(project_target_name),
+            project_env,
+            project_env.subst("$PROJECT_DIR"),
+        )
+    )
 
 #
 # Generate mbedtls bundle
@@ -1449,4 +1503,6 @@ env.Replace(
 )
 
 # Propagate application offset to debug configurations
-env["IDE_EXTRA_DATA"].update({"application_offset": env.subst("$ESP32_APP_OFFSET")})
+env["INTEGRATION_EXTRA_DATA"].update(
+    {"application_offset": env.subst("$ESP32_APP_OFFSET")}
+)
